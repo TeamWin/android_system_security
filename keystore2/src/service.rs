@@ -18,18 +18,20 @@
 //! This crate implement the core Keystore 2.0 service API as defined by the Keystore 2.0
 //! AIDL spec.
 
-use crate::database::{KeyEntry, KeyEntryLoadBits, SubComponentType};
+use crate::database::{KeyEntryLoadBits, SubComponentType};
 use crate::error::{self, map_or_log_err, ErrorCode};
 use crate::globals::DB;
 use crate::permission;
 use crate::permission::KeyPerm;
 use crate::security_level::KeystoreSecurityLevel;
-use crate::utils::{check_grant_permission, check_key_permission, Asp};
+use crate::utils::{
+    check_grant_permission, check_key_permission, key_parameters_to_authorizations, Asp,
+};
+use android_hardware_keymint::aidl::android::hardware::keymint::SecurityLevel::SecurityLevel;
 use android_system_keystore2::aidl::android::system::keystore2::{
     Domain::Domain, IKeystoreSecurityLevel::IKeystoreSecurityLevel,
     IKeystoreService::BnKeystoreService, IKeystoreService::IKeystoreService,
     KeyDescriptor::KeyDescriptor, KeyEntryResponse::KeyEntryResponse, KeyMetadata::KeyMetadata,
-    SecurityLevel::SecurityLevel,
 };
 use anyhow::{anyhow, Context, Result};
 use binder::{IBinder, Interface, ThreadState};
@@ -68,7 +70,7 @@ impl KeystoreService {
     }
 
     fn get_key_entry(&self, key: &KeyDescriptor) -> Result<KeyEntryResponse> {
-        let mut key_entry: KeyEntry = DB
+        let (key_id_guard, mut key_entry) = DB
             .with(|db| {
                 db.borrow_mut().load_key_entry(
                     key.clone(),
@@ -92,13 +94,13 @@ impl KeystoreService {
             metadata: KeyMetadata {
                 key: KeyDescriptor {
                     domain: Domain::KEY_ID,
-                    nspace: key_entry.id(),
+                    nspace: key_id_guard.id(),
                     ..Default::default()
                 },
                 keySecurityLevel: key_entry.sec_level(),
                 certificate: key_entry.take_cert(),
                 certificateChain: key_entry.take_cert_chain(),
-                // TODO add key characteristics here.
+                authorizations: key_parameters_to_authorizations(key_entry.into_key_parameters()),
                 ..Default::default()
             },
         })
@@ -112,7 +114,7 @@ impl KeystoreService {
     ) -> Result<()> {
         DB.with::<_, Result<()>>(|db| {
             let mut db = db.borrow_mut();
-            let key_entry = db
+            let (key_id_guard, key_entry) = db
                 .load_key_entry(
                     key.clone(),
                     KeyEntryLoadBits::NONE,
@@ -125,13 +127,13 @@ impl KeystoreService {
                 .context("Failed to load key_entry.")?;
 
             if let Some(cert) = public_cert {
-                db.insert_blob(key_entry.id(), SubComponentType::CERT, cert, key_entry.sec_level())
+                db.insert_blob(&key_id_guard, SubComponentType::CERT, cert, key_entry.sec_level())
                     .context("Failed to update cert subcomponent.")?;
             }
 
             if let Some(cert_chain) = certificate_chain {
                 db.insert_blob(
-                    key_entry.id(),
+                    &key_id_guard,
                     SubComponentType::CERT_CHAIN,
                     cert_chain,
                     key_entry.sec_level(),
@@ -193,7 +195,7 @@ impl IKeystoreService for KeystoreService {
         &self,
         security_level: SecurityLevel,
     ) -> binder::public_api::Result<Box<dyn IKeystoreSecurityLevel>> {
-        map_or_log_err(self.get_security_level(security_level), Ok)
+        map_or_log_err(self.get_security_level(SecurityLevel(security_level.0)), Ok)
     }
     fn getKeyEntry(&self, key: &KeyDescriptor) -> binder::public_api::Result<KeyEntryResponse> {
         map_or_log_err(self.get_key_entry(key), Ok)
