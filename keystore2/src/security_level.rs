@@ -20,7 +20,7 @@ use android_hardware_security_keymint::aidl::android::hardware::security::keymin
     Algorithm::Algorithm, ByteArray::ByteArray, Certificate::Certificate as KmCertificate,
     HardwareAuthenticatorType::HardwareAuthenticatorType, IKeyMintDevice::IKeyMintDevice,
     KeyCharacteristics::KeyCharacteristics, KeyFormat::KeyFormat, KeyParameter::KeyParameter,
-    KeyPurpose::KeyPurpose, SecurityLevel::SecurityLevel, Tag::Tag,
+    KeyParameterValue::KeyParameterValue, SecurityLevel::SecurityLevel, Tag::Tag,
 };
 use android_system_keystore2::aidl::android::system::keystore2::{
     AuthenticatorSpec::AuthenticatorSpec, CreateOperationResponse::CreateOperationResponse,
@@ -30,9 +30,12 @@ use android_system_keystore2::aidl::android::system::keystore2::{
     KeyMetadata::KeyMetadata, KeyParameters::KeyParameters,
 };
 
-use crate::permission::KeyPerm;
 use crate::utils::{check_key_permission, Asp};
 use crate::{database::KeyIdGuard, globals::DB};
+use crate::{
+    database::{DateTime, KeyMetaData, KeyMetaEntry, KeyType},
+    permission::KeyPerm,
+};
 use crate::{
     database::{KeyEntry, KeyEntryLoadBits, SubComponentType},
     operation::KeystoreOperation,
@@ -114,6 +117,8 @@ impl KeystoreSecurityLevel {
         let key_parameters =
             key_characteristics_to_internal(key_characteristics, self.security_level);
 
+        let creation_date = DateTime::now().context("Trying to make creation time.")?;
+
         let key = match key.domain {
             Domain::BLOB => {
                 KeyDescriptor { domain: Domain::BLOB, blob: Some(blob.data), ..Default::default() }
@@ -126,7 +131,7 @@ impl KeystoreSecurityLevel {
                         .context("Trying to create a key entry.")?;
                     db.insert_blob(
                         &key_id,
-                        SubComponentType::KM_BLOB,
+                        SubComponentType::KEY_BLOB,
                         &blob.data,
                         self.security_level,
                     )
@@ -146,6 +151,10 @@ impl KeystoreSecurityLevel {
                     }
                     db.insert_keyparameter(&key_id, &key_parameters)
                         .context("Trying to insert key parameters.")?;
+                    let mut metadata = KeyMetaData::new();
+                    metadata.add(KeyMetaEntry::CreationDate(creation_date));
+                    db.insert_key_metadata(&key_id, &metadata)
+                        .context("Trying to insert key metadata.")?;
                     match &key.alias {
                         Some(alias) => db
                             .rebind_alias(&key_id, alias, key.domain, key.nspace)
@@ -171,7 +180,7 @@ impl KeystoreSecurityLevel {
             certificate: cert,
             certificateChain: cert_chain,
             authorizations: crate::utils::key_parameters_to_authorizations(key_parameters),
-            ..Default::default()
+            modificationTimeMs: creation_date.to_millis_epoch(),
         })
     }
 
@@ -208,6 +217,7 @@ impl KeystoreSecurityLevel {
                     .with::<_, Result<(KeyIdGuard, KeyEntry)>>(|db| {
                         db.borrow_mut().load_key_entry(
                             key.clone(),
+                            KeyType::Client,
                             KeyEntryLoadBits::KM,
                             caller_uid,
                             |k, av| check_key_permission(KeyPerm::use_(), k, &av),
@@ -234,7 +244,11 @@ impl KeystoreSecurityLevel {
         let purpose = operation_parameters.iter().find(|p| p.tag == Tag::PURPOSE).map_or(
             Err(Error::Km(ErrorCode::INVALID_ARGUMENT))
                 .context("In create_operation: No operation purpose specified."),
-            |kp| Ok(KeyPurpose(kp.integer)),
+            |kp| match kp.value {
+                KeyParameterValue::KeyPurpose(p) => Ok(p),
+                _ => Err(Error::Km(ErrorCode::INVALID_ARGUMENT))
+                    .context("In create_operation: Malformed KeyParameter."),
+            },
         )?;
 
         let km_dev: Box<dyn IKeyMintDevice> = self
@@ -365,11 +379,14 @@ impl KeystoreSecurityLevel {
             .find(|p| p.tag == Tag::ALGORITHM)
             .ok_or(error::Error::Km(ErrorCode::INVALID_ARGUMENT))
             .context("No KeyParameter 'Algorithm'.")
-            .and_then(|p| match Algorithm(p.integer) {
-                Algorithm::AES | Algorithm::HMAC | Algorithm::TRIPLE_DES => Ok(KeyFormat::RAW),
-                Algorithm::RSA | Algorithm::EC => Ok(KeyFormat::PKCS8),
-                algorithm => Err(error::Error::Km(ErrorCode::INVALID_ARGUMENT))
-                    .context(format!("Unknown Algorithm {:?}.", algorithm)),
+            .and_then(|p| match &p.value {
+                KeyParameterValue::Algorithm(Algorithm::AES)
+                | KeyParameterValue::Algorithm(Algorithm::HMAC)
+                | KeyParameterValue::Algorithm(Algorithm::TRIPLE_DES) => Ok(KeyFormat::RAW),
+                KeyParameterValue::Algorithm(Algorithm::RSA)
+                | KeyParameterValue::Algorithm(Algorithm::EC) => Ok(KeyFormat::PKCS8),
+                v => Err(error::Error::Km(ErrorCode::INVALID_ARGUMENT))
+                    .context(format!("Unknown Algorithm {:?}.", v)),
             })
             .context("In import_key.")?;
 
@@ -432,6 +449,7 @@ impl KeystoreSecurityLevel {
             .with(|db| {
                 db.borrow_mut().load_key_entry(
                     wrapping_key.clone(),
+                    KeyType::Client,
                     KeyEntryLoadBits::KM,
                     ThreadState::get_calling_uid(),
                     |k, av| check_key_permission(KeyPerm::use_(), k, &av),
@@ -517,7 +535,7 @@ impl KeystoreSecurityLevel {
                     DB.with(|db| {
                         db.borrow_mut().insert_blob(
                             &key_id_guard,
-                            SubComponentType::KM_BLOB,
+                            SubComponentType::KEY_BLOB,
                             &upgraded_blob,
                             self.security_level,
                         )
